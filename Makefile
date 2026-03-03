@@ -38,10 +38,11 @@ TILE_GROUP_DIM_Y ?= 8
 INCLUDES := -Iinclude -I$(APP_DIR) -I.
 COMMON_DEFINES := -DHB_NATIVE_SIM -DTILE_GROUP_DIM_X=$(TILE_GROUP_DIM_X) -DTILE_GROUP_DIM_Y=$(TILE_GROUP_DIM_Y)
 
-include $(TEST_DEFS_MK)
-
 TESTS =
+ifneq ($(MAKECMDGOALS),clean)
+include $(TEST_DEFS_MK)
 include $(TESTS_MK)
+endif
 
 NATIVE_BINS := $(addprefix $(BIN_DIR)/,$(addsuffix /$(TARGET),$(TESTS)))
 

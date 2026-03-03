@@ -18,21 +18,59 @@ int (*g_program_main)(int, char**) = nullptr;
 std::unordered_map<std::string, kernel_descriptor> g_kernels;
 thread_local core_context* g_current_core = nullptr;
 
+std::uint64_t snapshot_hash(const volatile void* addr, std::size_t size) {
+  auto* bytes = static_cast<const volatile std::uint8_t*>(addr);
+  std::uint64_t hash = 1469598103934665603ull;
+  for (std::size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ull;
+  }
+  return hash ^ size;
+}
+
+int load_int_prefix(const volatile void* addr, std::size_t size) {
+  int value = 0;
+  auto* out = reinterpret_cast<std::uint8_t*>(&value);
+  auto* bytes = static_cast<const volatile std::uint8_t*>(addr);
+  const std::size_t copy_size = std::min(size, sizeof(value));
+  for (std::size_t i = 0; i < copy_size; ++i) {
+    out[i] = bytes[i];
+  }
+  return value;
+}
+
 void set_core_status(core_context& context, core_status status) {
   context.simulation->statuses[context.core_index].store(status, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
   context.simulation->wait_targets[context.core_index].store(0, std::memory_order_release);
 }
 
 void set_wait_word_state(core_context& context, wait_word* waited_word, std::uint64_t target_version) {
   context.simulation->statuses[context.core_index].store(core_status::waiting_wait_word, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(waited_word, std::memory_order_release);
+  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
   context.simulation->wait_targets[context.core_index].store(target_version, std::memory_order_release);
+}
+
+void set_memory_wait_state(core_context& context,
+                           const volatile void* waited_addr,
+                           std::size_t waited_size,
+                           std::uint64_t target_snapshot) {
+  context.simulation->statuses[context.core_index].store(core_status::waiting_memory, std::memory_order_release);
+  context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->waited_addrs[context.core_index].store(waited_addr, std::memory_order_release);
+  context.simulation->wait_sizes[context.core_index].store(waited_size, std::memory_order_release);
+  context.simulation->wait_targets[context.core_index].store(target_snapshot, std::memory_order_release);
 }
 
 void set_barrier_state(core_context& context, std::uint64_t target_generation) {
   context.simulation->statuses[context.core_index].store(core_status::waiting_barrier, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
   context.simulation->wait_targets[context.core_index].store(target_generation, std::memory_order_release);
 }
 
@@ -49,6 +87,12 @@ bool core_can_run(const simulation_state& simulation, const barrier_t& barrier, 
       wait_word* word = simulation.waited_words[core_index].load(std::memory_order_acquire);
       const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
       return word != nullptr && word->version.load(std::memory_order_acquire) != target;
+    }
+    case core_status::waiting_memory: {
+      const volatile void* addr = simulation.waited_addrs[core_index].load(std::memory_order_acquire);
+      const std::size_t size = simulation.wait_sizes[core_index].load(std::memory_order_acquire);
+      const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
+      return addr != nullptr && snapshot_hash(addr, size) != target;
     }
     case core_status::waiting_barrier: {
       const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
@@ -70,6 +114,11 @@ void request_abort(simulation_state& simulation, barrier_t& barrier) {
     }
     word->version.fetch_add(1, std::memory_order_acq_rel);
     word->version.notify_all();
+  }
+
+  for (auto& wake_epoch : simulation.wake_epochs) {
+    wake_epoch.fetch_add(1, std::memory_order_acq_rel);
+    wake_epoch.notify_all();
   }
 }
 
@@ -186,6 +235,8 @@ int current_y() {
 int bsg_lr(wait_word* word) {
   core_context& context = current_core_context();
   context.reservation.word = word;
+  context.reservation.addr = nullptr;
+  context.reservation.size = 0;
   context.reservation.version = word->version.load(std::memory_order_acquire);
   return word->value.load(std::memory_order_acquire);
 }
@@ -203,6 +254,37 @@ int bsg_lr_aq(wait_word* word) {
   context.reservation = {};
   set_core_status(context, core_status::running);
   return word->value.load(std::memory_order_acquire);
+}
+
+int bsg_lr(const volatile void* addr, std::size_t size) {
+  core_context& context = current_core_context();
+  context.reservation.word = nullptr;
+  context.reservation.addr = addr;
+  context.reservation.size = size;
+  context.reservation.version = snapshot_hash(addr, size);
+  return load_int_prefix(addr, size);
+}
+
+int bsg_lr_aq(const volatile void* addr, std::size_t size) {
+  core_context& context = current_core_context();
+  const std::uint64_t target = (context.reservation.word == nullptr &&
+                                context.reservation.addr == addr &&
+                                context.reservation.size == size)
+                                   ? context.reservation.version
+                                   : snapshot_hash(addr, size);
+  set_memory_wait_state(context, addr, size, target);
+
+  auto& wake_epoch = context.simulation->wake_epochs[context.core_index];
+  std::uint64_t observed_epoch = wake_epoch.load(std::memory_order_acquire);
+  while (snapshot_hash(addr, size) == target) {
+    wake_epoch.wait(observed_epoch, std::memory_order_acquire);
+    throw_if_abort_requested();
+    observed_epoch = wake_epoch.load(std::memory_order_acquire);
+  }
+
+  context.reservation = {};
+  set_core_status(context, core_status::running);
+  return load_int_prefix(addr, size);
 }
 
 void wait_word_store(wait_word& word, int value) {
@@ -263,8 +345,17 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   for (auto& waited_word : simulation.waited_words) {
     waited_word.store(nullptr, std::memory_order_relaxed);
   }
+  for (auto& waited_addr : simulation.waited_addrs) {
+    waited_addr.store(nullptr, std::memory_order_relaxed);
+  }
+  for (auto& wait_size : simulation.wait_sizes) {
+    wait_size.store(0, std::memory_order_relaxed);
+  }
   for (auto& wait_target : simulation.wait_targets) {
     wait_target.store(0, std::memory_order_relaxed);
+  }
+  for (auto& wake_epoch : simulation.wake_epochs) {
+    wake_epoch.store(0, std::memory_order_relaxed);
   }
 
   std::vector<std::thread> threads;
@@ -274,7 +365,7 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   std::mutex error_mutex;
 
   watchdog = std::thread([&] {
-    const auto poll_interval = std::chrono::milliseconds(10);
+    const auto poll_interval = std::chrono::milliseconds(1);
 
     while (!simulation.abort_requested.load(std::memory_order_acquire)) {
       std::size_t terminated_or_failed = 0;
@@ -284,6 +375,15 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
         const core_status status = simulation.statuses[i].load(std::memory_order_acquire);
         if (status == core_status::terminated || status == core_status::failed) {
           ++terminated_or_failed;
+        }
+        if (status == core_status::waiting_memory) {
+          const volatile void* addr = simulation.waited_addrs[i].load(std::memory_order_acquire);
+          const std::size_t size = simulation.wait_sizes[i].load(std::memory_order_acquire);
+          const std::uint64_t target = simulation.wait_targets[i].load(std::memory_order_acquire);
+          if (addr != nullptr && snapshot_hash(addr, size) != target) {
+            simulation.wake_epochs[i].fetch_add(1, std::memory_order_acq_rel);
+            simulation.wake_epochs[i].notify_all();
+          }
         }
         if (core_can_run(simulation, barrier, i)) {
           any_runnable = true;

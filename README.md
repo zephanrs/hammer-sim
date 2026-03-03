@@ -8,7 +8,7 @@ directory.
 Build all tests for an app:
 
 ```sh
-make -C hammer-sim APP_DIR=../hammerblade
+make -C hammer-sim APP_DIR=/path/to/app
 ```
 
 That creates one executable per test and a generated runner makefile at:
@@ -20,13 +20,13 @@ hammer-sim/bin/<app-name>/Makefile
 Run all tests with a compact summary:
 
 ```sh
-make -C hammer-sim/bin/hammerblade run-all
+make -C hammer-sim/bin/<app-name> run-all
 ```
 
 Run one test with full output:
 
 ```sh
-make -C hammer-sim/bin/hammerblade run-seq-len_32__num-seq_64
+make -C hammer-sim/bin/<app-name> run-<test-name>
 ```
 
 Clean generated output:
@@ -107,6 +107,26 @@ and call those functions directly.
 - `bsg_lr` / `bsg_lr_aq`
 - remote scratchpad accesses derived from file-scope variables in `kernel.cpp`
 - native AMOs on plain memory
+
+## bsg_lr / bsg_lr_aq
+
+`hammer-sim` supports `bsg_lr` / `bsg_lr_aq` on:
+
+- file-scope globals in `kernel.cpp`
+- fields inside file-scope globals
+- array elements inside file-scope globals
+
+For non-`int` objects, pass the real pointer type:
+
+```cpp
+bsg_lr(&flag_struct.ready);
+bsg_lr(&mailbox_array[i]);
+```
+
+Do not cast everything to `int*` unless you only want to watch 4 bytes. The
+watched byte range is `sizeof(*ptr)` for the pointer type you pass in.
+
+`volatile int` wait words are still supported and remain the fastest path.
 
 ## Current Limitation
 

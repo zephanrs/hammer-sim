@@ -25,8 +25,23 @@ inline void* bsg_remote_ptr(int x, int y, const void* ptr) {
   return hb_native_sim::remote_ptr(x, y, ptr);
 }
 
-using hb_native_sim::bsg_lr;
-using hb_native_sim::bsg_lr_aq;
+inline int bsg_lr(hb_native_sim::wait_word* word) {
+  return hb_native_sim::bsg_lr(word);
+}
+
+inline int bsg_lr_aq(hb_native_sim::wait_word* word) {
+  return hb_native_sim::bsg_lr_aq(word);
+}
+
+template <typename T>
+inline int bsg_lr(T* ptr) {
+  return hb_native_sim::bsg_lr(static_cast<const volatile void*>(ptr), sizeof(T));
+}
+
+template <typename T>
+inline int bsg_lr_aq(T* ptr) {
+  return hb_native_sim::bsg_lr_aq(static_cast<const volatile void*>(ptr), sizeof(T));
+}
 
 inline void bsg_fence() {
   hb_native_sim::fence();

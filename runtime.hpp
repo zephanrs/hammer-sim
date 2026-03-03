@@ -24,6 +24,8 @@ struct wait_word {
 
 struct reservation_t {
   wait_word* word = nullptr;
+  const volatile void* addr = nullptr;
+  std::size_t size = 0;
   std::uint64_t version = 0;
 };
 
@@ -31,9 +33,10 @@ enum class core_status : std::uint8_t {
   starting = 0,
   running = 1,
   waiting_wait_word = 2,
-  waiting_barrier = 3,
-  terminated = 4,
-  failed = 5,
+  waiting_memory = 3,
+  waiting_barrier = 4,
+  terminated = 5,
+  failed = 6,
 };
 
 struct barrier_t {
@@ -46,11 +49,15 @@ struct barrier_t {
 
 struct simulation_state {
   explicit simulation_state(std::size_t core_count)
-      : statuses(core_count), waited_words(core_count), wait_targets(core_count) {}
+      : statuses(core_count), waited_words(core_count), waited_addrs(core_count),
+        wait_sizes(core_count), wait_targets(core_count), wake_epochs(core_count) {}
 
   std::vector<std::atomic<core_status>> statuses;
   std::vector<std::atomic<wait_word*>> waited_words;
+  std::vector<std::atomic<const volatile void*>> waited_addrs;
+  std::vector<std::atomic<std::size_t>> wait_sizes;
   std::vector<std::atomic<std::uint64_t>> wait_targets;
+  std::vector<std::atomic<std::uint64_t>> wake_epochs;
   std::atomic<bool> abort_requested{false};
   std::atomic<bool> deadlock_detected{false};
 };
@@ -115,6 +122,8 @@ int current_y();
 
 int bsg_lr(wait_word* word);
 int bsg_lr_aq(wait_word* word);
+int bsg_lr(const volatile void* addr, std::size_t size);
+int bsg_lr_aq(const volatile void* addr, std::size_t size);
 void wait_word_store(wait_word& word, int value);
 
 void barrier_init();

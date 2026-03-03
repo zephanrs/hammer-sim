@@ -98,6 +98,12 @@ def extract_var_name(stmt: str) -> str:
     return match.group(1)
 
 
+def normalize_scratchpad_decl(stmt: str) -> str:
+    body = stmt.strip()
+    body = re.sub(r'^static\s+', '', body)
+    return body
+
+
 def remove_spans(text: str, spans):
     # Remove the extracted declarations from the kernel source so we can
     # re-home them inside the generated scratchpad struct.
@@ -168,7 +174,7 @@ def main() -> int:
     statements = split_top_level_statements(transformed)
     var_spans = [(start, end, stmt) for start, end, stmt in statements if is_variable_statement(stmt)]
     var_names = [extract_var_name(stmt) for _, _, stmt in var_spans]
-    var_decls = [stmt.strip() for _, _, stmt in var_spans]
+    var_decls = [normalize_scratchpad_decl(stmt) for _, _, stmt in var_spans]
 
     if var_spans:
         first_var_start = var_spans[0][0]
