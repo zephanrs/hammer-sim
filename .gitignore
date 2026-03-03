@@ -1,3 +1,4 @@
 build/
 bin/
 hammer-sim
+scripts/__pycache__/

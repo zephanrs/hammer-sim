@@ -35,6 +35,15 @@ Clean generated output:
 make -C hammer-sim clean
 ```
 
+From the repository root, the wrapper makefile can build and run the checked-in
+apps directly:
+
+```sh
+make native
+make native APP=2d
+make native APP=chaining TEST=chain-len_256__lookback_4
+```
+
 ## Required App Files
 
 The app directory must contain:
@@ -106,6 +115,7 @@ and call those functions directly.
 - tile-group barriers
 - `bsg_lr` / `bsg_lr_aq`
 - remote scratchpad accesses derived from file-scope variables in `kernel.cpp`
+- simulator-side `unroll.hpp` overrides for bulk scratchpad copies
 - native AMOs on plain memory
 
 ## bsg_lr / bsg_lr_aq
@@ -116,22 +126,36 @@ and call those functions directly.
 - fields inside file-scope globals
 - array elements inside file-scope globals
 
-For non-`int` objects, pass the real pointer type:
+Reservations are tracked per local 4-byte scratchpad word. `bsg_lr` may point at
+any local address as long as the addressed 4-byte segment stays within the
+current tile's scratchpad.
+
+The simulated behavior is:
+
+- `bsg_lr(addr)` loads the current 32-bit value and records a reservation on the
+  containing 4-byte local scratchpad word
+- `bsg_lr_aq(addr)` stalls until a store touches that same 4-byte word
+- if the write already happened after `bsg_lr` and before `bsg_lr_aq`, the
+  acquire does not stall
+
+Typical usage:
 
 ```cpp
-bsg_lr(&flag_struct.ready);
-bsg_lr(&mailbox_array[i]);
+int rdy = bsg_lr(&flag_struct.ready);
+if (!rdy) bsg_lr_aq(&flag_struct.ready);
 ```
 
-Do not cast everything to `int*` unless you only want to watch 4 bytes. The
-watched byte range is `sizeof(*ptr)` for the pointer type you pass in.
-
-`volatile int` wait words are still supported and remain the fastest path.
+`hammer-sim` does not model arbitrary-sized LR reservations. It models the
+HammerBlade-style 4-byte scratchpad wait word behavior.
 
 ## Current Limitation
 
 Remote scratchpad accesses are only modeled for addresses derived from
 file-scope variables declared directly in `kernel.cpp`.
+
+Generated stores to those objects are rewritten through `hb_native_sim::store`,
+and the simulator `unroll.hpp` routes unrolled copy traffic through
+`hb_native_sim::load` / `hb_native_sim::store`.
 
 Remote accesses to stack locals or function-local objects are not supported.
 

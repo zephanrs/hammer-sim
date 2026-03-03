@@ -18,59 +18,170 @@ int (*g_program_main)(int, char**) = nullptr;
 std::unordered_map<std::string, kernel_descriptor> g_kernels;
 thread_local core_context* g_current_core = nullptr;
 
-std::uint64_t snapshot_hash(const volatile void* addr, std::size_t size) {
-  auto* bytes = static_cast<const volatile std::uint8_t*>(addr);
-  std::uint64_t hash = 1469598103934665603ull;
-  for (std::size_t i = 0; i < size; ++i) {
-    hash ^= bytes[i];
-    hash *= 1099511628211ull;
-  }
-  return hash ^ size;
+constexpr std::size_t k_lr_word_size = sizeof(int);
+
+const std::uint8_t* as_bytes(const volatile void* addr) {
+  return static_cast<const std::uint8_t*>(const_cast<void*>(addr));
 }
 
-int load_int_prefix(const volatile void* addr, std::size_t size) {
-  int value = 0;
-  auto* out = reinterpret_cast<std::uint8_t*>(&value);
-  auto* bytes = static_cast<const volatile std::uint8_t*>(addr);
-  const std::size_t copy_size = std::min(size, sizeof(value));
-  for (std::size_t i = 0; i < copy_size; ++i) {
+std::size_t ceil_div(std::size_t value, std::size_t divisor) {
+  return (value + divisor - 1) / divisor;
+}
+
+reservation_word_t& reservation_word_for_offset(simulation_state& simulation,
+                                                std::size_t tile_index,
+                                                std::size_t local_offset) {
+  const std::size_t word_index = (tile_index * simulation.words_per_tile) + (local_offset / k_lr_word_size);
+  return simulation.scratchpad_words[word_index];
+}
+
+struct scratchpad_span_t {
+  bool in_scratchpad = false;
+  std::size_t first_tile = 0;
+  std::size_t last_tile = 0;
+};
+
+scratchpad_span_t scratchpad_span_for(simulation_state& simulation,
+                                      const volatile void* addr,
+                                      std::size_t size) {
+  scratchpad_span_t span;
+  if (size == 0 || simulation.scratchpad_block == nullptr || simulation.scratchpad_size == 0) {
+    return span;
+  }
+
+  const auto* block = static_cast<const std::uint8_t*>(simulation.scratchpad_block);
+  const std::size_t tile_count = simulation.statuses.size();
+  const std::size_t block_size = tile_count * simulation.scratchpad_size;
+  const auto* ptr = as_bytes(addr);
+  if (ptr < block || ptr >= (block + block_size)) {
+    return span;
+  }
+
+  const std::size_t start_offset = static_cast<std::size_t>(ptr - block);
+  const std::size_t end_offset = start_offset + size - 1;
+  if (end_offset >= block_size) {
+    throw std::runtime_error("scratchpad access out of range");
+  }
+
+  span.in_scratchpad = true;
+  span.first_tile = start_offset / simulation.scratchpad_size;
+  span.last_tile = end_offset / simulation.scratchpad_size;
+  return span;
+}
+
+template <typename Fn>
+auto with_scratchpad_locks(simulation_state& simulation,
+                           const volatile void* addr,
+                           std::size_t size,
+                           Fn&& fn) -> decltype(fn()) {
+  const scratchpad_span_t span = scratchpad_span_for(simulation, addr, size);
+  if (!span.in_scratchpad) {
+    return fn();
+  }
+
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(span.last_tile - span.first_tile + 1);
+  for (std::size_t tile = span.first_tile; tile <= span.last_tile; ++tile) {
+    locks.emplace_back(simulation.scratchpad_mutexes[tile]);
+  }
+  return fn();
+}
+
+void copy_from_volatile(const volatile void* src, void* dst, std::size_t size) {
+  auto* out = static_cast<std::uint8_t*>(dst);
+  auto* bytes = static_cast<const volatile std::uint8_t*>(src);
+  for (std::size_t i = 0; i < size; ++i) {
     out[i] = bytes[i];
   }
+}
+
+void copy_to_volatile(volatile void* dst, const void* src, std::size_t size) {
+  auto* out = static_cast<volatile std::uint8_t*>(dst);
+  auto* bytes = static_cast<const std::uint8_t*>(src);
+  for (std::size_t i = 0; i < size; ++i) {
+    out[i] = bytes[i];
+  }
+}
+
+int load_int_prefix(const volatile void* addr) {
+  int value = 0;
+  copy_from_volatile(addr, &value, sizeof(value));
   return value;
+}
+
+reservation_word_t& local_reservation_word(core_context& context, const volatile void* addr) {
+  const auto* local_base = static_cast<const std::uint8_t*>(context.scratchpad_base);
+  const auto* ptr = as_bytes(addr);
+  const std::ptrdiff_t offset = ptr - local_base;
+
+  if (offset < 0 || static_cast<std::size_t>(offset) + k_lr_word_size > context.scratchpad_size) {
+    throw std::runtime_error("bsg_lr source outside local scratchpad");
+  }
+
+  return reservation_word_for_offset(*context.simulation,
+                                     context.core_index,
+                                     static_cast<std::size_t>(offset));
+}
+
+int load_reserved_word(const volatile void* addr, reservation_word_t& word, std::uint64_t* epoch_out = nullptr) {
+  core_context& context = current_core_context();
+  int value = 0;
+  std::uint64_t epoch = 0;
+  with_scratchpad_locks(*context.simulation, addr, sizeof(value), [&] {
+    epoch = word.epoch.load(std::memory_order_acquire);
+    value = load_int_prefix(addr);
+  });
+  if (epoch_out != nullptr) {
+    *epoch_out = epoch;
+  }
+  return value;
+}
+
+void notify_store_words(simulation_state& simulation, const volatile void* addr, std::size_t size) {
+  if (size == 0 || simulation.words_per_tile == 0) {
+    return;
+  }
+
+  const scratchpad_span_t span = scratchpad_span_for(simulation, addr, size);
+  if (!span.in_scratchpad) {
+    return;
+  }
+
+  const auto* block = static_cast<const std::uint8_t*>(simulation.scratchpad_block);
+  const std::size_t start_offset = static_cast<std::size_t>(as_bytes(addr) - block);
+  const std::size_t end_offset = start_offset + size - 1;
+  for (std::size_t tile = span.first_tile; tile <= span.last_tile; ++tile) {
+    const std::size_t tile_base = tile * simulation.scratchpad_size;
+    const std::size_t local_start = (tile == span.first_tile) ? (start_offset - tile_base) : 0;
+    const std::size_t local_end = (tile == span.last_tile) ? (end_offset - tile_base) : (simulation.scratchpad_size - 1);
+    const std::size_t start_word = local_start / k_lr_word_size;
+    const std::size_t end_word = local_end / k_lr_word_size;
+
+    for (std::size_t word = start_word; word <= end_word; ++word) {
+      auto& epoch = reservation_word_for_offset(simulation, tile, word * k_lr_word_size).epoch;
+      epoch.fetch_add(1, std::memory_order_acq_rel);
+      epoch.notify_all();
+    }
+  }
 }
 
 void set_core_status(core_context& context, core_status status) {
   context.simulation->statuses[context.core_index].store(status, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
   context.simulation->wait_targets[context.core_index].store(0, std::memory_order_release);
 }
 
-void set_wait_word_state(core_context& context, wait_word* waited_word, std::uint64_t target_version) {
-  context.simulation->statuses[context.core_index].store(core_status::waiting_wait_word, std::memory_order_release);
-  context.simulation->waited_words[context.core_index].store(waited_word, std::memory_order_release);
-  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
-  context.simulation->wait_targets[context.core_index].store(target_version, std::memory_order_release);
-}
-
 void set_memory_wait_state(core_context& context,
-                           const volatile void* waited_addr,
-                           std::size_t waited_size,
-                           std::uint64_t target_snapshot) {
+                           reservation_word_t* waited_word,
+                           std::uint64_t target_epoch) {
   context.simulation->statuses[context.core_index].store(core_status::waiting_memory, std::memory_order_release);
-  context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->waited_addrs[context.core_index].store(waited_addr, std::memory_order_release);
-  context.simulation->wait_sizes[context.core_index].store(waited_size, std::memory_order_release);
-  context.simulation->wait_targets[context.core_index].store(target_snapshot, std::memory_order_release);
+  context.simulation->waited_words[context.core_index].store(waited_word, std::memory_order_release);
+  context.simulation->wait_targets[context.core_index].store(target_epoch, std::memory_order_release);
 }
 
 void set_barrier_state(core_context& context, std::uint64_t target_generation) {
   context.simulation->statuses[context.core_index].store(core_status::waiting_barrier, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->waited_addrs[context.core_index].store(nullptr, std::memory_order_release);
-  context.simulation->wait_sizes[context.core_index].store(0, std::memory_order_release);
   context.simulation->wait_targets[context.core_index].store(target_generation, std::memory_order_release);
 }
 
@@ -83,16 +194,10 @@ bool core_can_run(const simulation_state& simulation, const barrier_t& barrier, 
     case core_status::terminated:
     case core_status::failed:
       return false;
-    case core_status::waiting_wait_word: {
-      wait_word* word = simulation.waited_words[core_index].load(std::memory_order_acquire);
-      const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
-      return word != nullptr && word->version.load(std::memory_order_acquire) != target;
-    }
     case core_status::waiting_memory: {
-      const volatile void* addr = simulation.waited_addrs[core_index].load(std::memory_order_acquire);
-      const std::size_t size = simulation.wait_sizes[core_index].load(std::memory_order_acquire);
+      reservation_word_t* waited_word = simulation.waited_words[core_index].load(std::memory_order_acquire);
       const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
-      return addr != nullptr && snapshot_hash(addr, size) != target;
+      return waited_word != nullptr && waited_word->epoch.load(std::memory_order_acquire) != target;
     }
     case core_status::waiting_barrier: {
       const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
@@ -107,18 +212,9 @@ void request_abort(simulation_state& simulation, barrier_t& barrier) {
   barrier.generation.fetch_add(1, std::memory_order_acq_rel);
   barrier.generation.notify_all();
 
-  for (auto& slot : simulation.waited_words) {
-    wait_word* word = slot.load(std::memory_order_acquire);
-    if (word == nullptr) {
-      continue;
-    }
-    word->version.fetch_add(1, std::memory_order_acq_rel);
-    word->version.notify_all();
-  }
-
-  for (auto& wake_epoch : simulation.wake_epochs) {
-    wake_epoch.fetch_add(1, std::memory_order_acq_rel);
-    wake_epoch.notify_all();
+  for (auto& word : simulation.scratchpad_words) {
+    word.epoch.fetch_add(1, std::memory_order_acq_rel);
+    word.epoch.notify_all();
   }
 }
 
@@ -143,17 +239,6 @@ int atomic_fetch_op(int* addr, int value, Op op) {
 }
 
 }  // namespace
-
-wait_word& wait_word::operator=(int next) {
-  value.store(next, std::memory_order_release);
-  version.fetch_add(1, std::memory_order_acq_rel);
-  version.notify_all();
-  return *this;
-}
-
-wait_word::operator int() const {
-  return value.load(std::memory_order_acquire);
-}
 
 void barrier_t::init(std::size_t count) {
   participants = count;
@@ -232,63 +317,72 @@ int current_y() {
   return current_core_context().y;
 }
 
-int bsg_lr(wait_word* word) {
+int bsg_lr(const volatile void* addr) {
   core_context& context = current_core_context();
-  context.reservation.word = word;
-  context.reservation.addr = nullptr;
-  context.reservation.size = 0;
-  context.reservation.version = word->version.load(std::memory_order_acquire);
-  return word->value.load(std::memory_order_acquire);
-}
-
-int bsg_lr_aq(wait_word* word) {
-  core_context& context = current_core_context();
-  const std::uint64_t target = context.reservation.word == word
-                                   ? context.reservation.version
-                                   : word->version.load(std::memory_order_acquire);
-  set_wait_word_state(context, word, target);
-  while (word->version.load(std::memory_order_acquire) == target) {
-    word->version.wait(target, std::memory_order_acquire);
-    throw_if_abort_requested();
-  }
-  context.reservation = {};
-  set_core_status(context, core_status::running);
-  return word->value.load(std::memory_order_acquire);
-}
-
-int bsg_lr(const volatile void* addr, std::size_t size) {
-  core_context& context = current_core_context();
-  context.reservation.word = nullptr;
+  reservation_word_t& word = local_reservation_word(context, addr);
   context.reservation.addr = addr;
-  context.reservation.size = size;
-  context.reservation.version = snapshot_hash(addr, size);
-  return load_int_prefix(addr, size);
+  context.reservation.word = &word;
+  return load_reserved_word(addr, word, &context.reservation.epoch);
 }
 
-int bsg_lr_aq(const volatile void* addr, std::size_t size) {
+int bsg_lr_aq(const volatile void* addr) {
   core_context& context = current_core_context();
-  const std::uint64_t target = (context.reservation.word == nullptr &&
-                                context.reservation.addr == addr &&
-                                context.reservation.size == size)
-                                   ? context.reservation.version
-                                   : snapshot_hash(addr, size);
-  set_memory_wait_state(context, addr, size, target);
+  reservation_word_t& word =
+      (context.reservation.addr == addr && context.reservation.word != nullptr)
+          ? *context.reservation.word
+          : local_reservation_word(context, addr);
+  const std::uint64_t target =
+      (context.reservation.addr == addr && context.reservation.word == &word)
+          ? context.reservation.epoch
+          : word.epoch.load(std::memory_order_acquire);
+  set_memory_wait_state(context, &word, target);
 
-  auto& wake_epoch = context.simulation->wake_epochs[context.core_index];
-  std::uint64_t observed_epoch = wake_epoch.load(std::memory_order_acquire);
-  while (snapshot_hash(addr, size) == target) {
-    wake_epoch.wait(observed_epoch, std::memory_order_acquire);
+  std::uint64_t observed_epoch = word.epoch.load(std::memory_order_acquire);
+  while (word.epoch.load(std::memory_order_acquire) == target) {
+    word.epoch.wait(observed_epoch, std::memory_order_acquire);
     throw_if_abort_requested();
-    observed_epoch = wake_epoch.load(std::memory_order_acquire);
+    observed_epoch = word.epoch.load(std::memory_order_acquire);
   }
 
+  std::this_thread::yield();
   context.reservation = {};
   set_core_status(context, core_status::running);
-  return load_int_prefix(addr, size);
+  return load_reserved_word(addr, word);
 }
 
-void wait_word_store(wait_word& word, int value) {
-  word = value;
+void load_bytes(const volatile void* addr, void* out, std::size_t size) {
+  core_context& context = current_core_context();
+  with_scratchpad_locks(*context.simulation, addr, size, [&] {
+    copy_from_volatile(addr, out, size);
+  });
+}
+
+void store_bytes(void* addr, const void* value, std::size_t size) {
+  store_bytes(static_cast<volatile void*>(addr), value, size);
+}
+
+void store_bytes(volatile void* addr, const void* value, std::size_t size) {
+  core_context& context = current_core_context();
+  with_scratchpad_locks(*context.simulation, addr, size, [&] {
+    copy_to_volatile(addr, value, size);
+    notify_store_words(*context.simulation, addr, size);
+  });
+}
+
+void store_int_word(int* addr, int value) {
+  core_context& context = current_core_context();
+  const scratchpad_span_t span = scratchpad_span_for(*context.simulation, addr, sizeof(int));
+  if (span.in_scratchpad) {
+    store_bytes(addr, &value, sizeof(value));
+    return;
+  }
+
+  std::atomic_ref<int> atomic_ref(*addr);
+  atomic_ref.store(value, std::memory_order_seq_cst);
+}
+
+void store_int_word(volatile int* addr, int value) {
+  store_int_word(const_cast<int*>(addr), value);
 }
 
 void barrier_init() {
@@ -338,24 +432,19 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   barrier_t barrier;
   barrier.init(tile_count);
 
-  simulation_state simulation(tile_count);
+  const std::size_t words_per_tile = ceil_div(kernel.scratchpad_size, k_lr_word_size);
+  simulation_state simulation(tile_count, tile_count * words_per_tile);
+  simulation.scratchpad_block = scratchpad_block;
+  simulation.scratchpad_size = kernel.scratchpad_size;
+  simulation.words_per_tile = words_per_tile;
   for (auto& status : simulation.statuses) {
     status.store(core_status::starting, std::memory_order_relaxed);
   }
   for (auto& waited_word : simulation.waited_words) {
     waited_word.store(nullptr, std::memory_order_relaxed);
   }
-  for (auto& waited_addr : simulation.waited_addrs) {
-    waited_addr.store(nullptr, std::memory_order_relaxed);
-  }
-  for (auto& wait_size : simulation.wait_sizes) {
-    wait_size.store(0, std::memory_order_relaxed);
-  }
   for (auto& wait_target : simulation.wait_targets) {
     wait_target.store(0, std::memory_order_relaxed);
-  }
-  for (auto& wake_epoch : simulation.wake_epochs) {
-    wake_epoch.store(0, std::memory_order_relaxed);
   }
 
   std::vector<std::thread> threads;
@@ -365,8 +454,7 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   std::mutex error_mutex;
 
   watchdog = std::thread([&] {
-    const auto poll_interval = std::chrono::milliseconds(1);
-
+    std::size_t quiescent_polls = 0;
     while (!simulation.abort_requested.load(std::memory_order_acquire)) {
       std::size_t terminated_or_failed = 0;
       bool any_runnable = false;
@@ -375,15 +463,6 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
         const core_status status = simulation.statuses[i].load(std::memory_order_acquire);
         if (status == core_status::terminated || status == core_status::failed) {
           ++terminated_or_failed;
-        }
-        if (status == core_status::waiting_memory) {
-          const volatile void* addr = simulation.waited_addrs[i].load(std::memory_order_acquire);
-          const std::size_t size = simulation.wait_sizes[i].load(std::memory_order_acquire);
-          const std::uint64_t target = simulation.wait_targets[i].load(std::memory_order_acquire);
-          if (addr != nullptr && snapshot_hash(addr, size) != target) {
-            simulation.wake_epochs[i].fetch_add(1, std::memory_order_acq_rel);
-            simulation.wake_epochs[i].notify_all();
-          }
         }
         if (core_can_run(simulation, barrier, i)) {
           any_runnable = true;
@@ -395,12 +474,18 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
       }
 
       if (!any_runnable) {
+        ++quiescent_polls;
+        if (quiescent_polls < 64) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          continue;
+        }
         simulation.deadlock_detected.store(true, std::memory_order_release);
         request_abort(simulation, barrier);
         return;
       }
 
-      std::this_thread::sleep_for(poll_interval);
+      quiescent_polls = 0;
+      std::this_thread::yield();
     }
   });
 

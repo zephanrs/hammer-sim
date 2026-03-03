@@ -15,6 +15,7 @@ def split_top_level_statements(text: str):
     spans = []
     start = None
     depth = 0
+    top_level_brace = None
     i = 0
     n = len(text)
     in_line_comment = False
@@ -62,11 +63,29 @@ def split_top_level_statements(text: str):
             continue
 
         if ch == '{':
+            if depth == 0:
+                top_level_brace = i
             depth += 1
         elif ch == '}':
+            closing_top_level_block = depth == 1 and start is not None and top_level_brace is not None
             depth = max(depth - 1, 0)
+            if closing_top_level_block:
+                prefix = text[start:top_level_brace].strip()
+                closes_definition = (
+                    '(' in prefix and ')' in prefix
+                ) or prefix.startswith(('namespace ', 'struct ', 'class ', 'union ', 'enum '))
+                if closes_definition:
+                    end = i + 1
+                    j = end
+                    while j < n and text[j].isspace():
+                        j += 1
+                    if j < n and text[j] == ';':
+                        end = j + 1
+                    spans.append((start, end, text[start:end]))
+                    start = None
+                top_level_brace = None
         elif depth == 0:
-            if start is None and not ch.isspace():
+            if start is None and not ch.isspace() and ch != ';':
                 start = i
             if ch == ';' and start is not None:
                 spans.append((start, i + 1, text[start:i + 1]))
@@ -155,6 +174,100 @@ def wrapper_arg(param_type: str, index: int) -> str:
     return f'static_cast<{param_type}>(argv[{index}])'
 
 
+def split_line_comment(line: str):
+    in_string = False
+    string_char = ''
+    i = 0
+    while i + 1 < len(line):
+        ch = line[i]
+        nxt = line[i + 1]
+        if in_string:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch == string_char:
+                in_string = False
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_string = True
+            string_char = ch
+            i += 1
+            continue
+        if ch == '/' and nxt == '/':
+            return line[:i], line[i:]
+        i += 1
+    return line, ''
+
+
+def find_assignment_index(stmt: str):
+    depth = 0
+    in_string = False
+    string_char = ''
+    for i, ch in enumerate(stmt):
+        prev = stmt[i - 1] if i > 0 else ''
+        nxt = stmt[i + 1] if i + 1 < len(stmt) else ''
+        if in_string:
+            if ch == '\\':
+                continue
+            if ch == string_char and prev != '\\':
+                in_string = False
+            continue
+        if ch in ('"', "'"):
+            in_string = True
+            string_char = ch
+            continue
+        if ch in '([{':
+            depth += 1
+            continue
+        if ch in ')]}':
+            depth = max(depth - 1, 0)
+            continue
+        if ch != '=' or depth != 0:
+            continue
+        if prev in '=!<>+-*/%&|^' or nxt == '=':
+            continue
+        return i
+    return None
+
+
+def looks_store_like(lhs: str, scratchpad_names) -> bool:
+    lhs = lhs.strip()
+    if '->' in lhs or '.' in lhs or '[' in lhs:
+        return True
+    if lhs.startswith('*') or lhs.startswith('(*'):
+        return True
+    return lhs in scratchpad_names
+
+
+def instrument_stores(body: str, scratchpad_names) -> str:
+    lines = []
+    for line in body.splitlines():
+        code, comment = split_line_comment(line)
+        stripped = code.strip()
+        if not stripped or not stripped.endswith(';'):
+            lines.append(line)
+            continue
+        if stripped.startswith(('#', 'if ', 'for ', 'while ', 'switch ', 'return ', 'case ')):
+            lines.append(line)
+            continue
+        assign_idx = find_assignment_index(stripped[:-1])
+        if assign_idx is None:
+            lines.append(line)
+            continue
+        lhs = stripped[:assign_idx].rstrip()
+        rhs = stripped[assign_idx + 1:-1].strip()
+        if not looks_store_like(lhs, scratchpad_names):
+            lines.append(line)
+            continue
+        indent = code[:len(code) - len(code.lstrip())]
+        new_line = f'{indent}hb_native_sim::store(&({lhs}), {rhs});'
+        if comment:
+            new_line += f' {comment}'
+        lines.append(new_line)
+    return '\n'.join(lines)
+
+
 def main() -> int:
     if len(sys.argv) != 3:
         print('usage: generate_kernel.py <input> <output>', file=sys.stderr)
@@ -164,12 +277,7 @@ def main() -> int:
     out_path = Path(sys.argv[2])
     original = src_path.read_text()
 
-    # Native wait/synchronization uses a richer type than the device source.
-    # These rewrites are intentionally narrow: only the lr/lr.aq wait-word path.
-    transformed = original.replace('volatile int', 'hb_native_sim::wait_word')
-    transformed = re.sub(r'bsg_lr\s*\(\s*\(int\s*\*\)\s*&', 'bsg_lr(&', transformed)
-    transformed = re.sub(r'bsg_lr_aq\s*\(\s*\(int\s*\*\)\s*&', 'bsg_lr_aq(&', transformed)
-    transformed = re.sub(r'\(hb_native_sim::wait_word \*\)', '(hb_native_sim::wait_word *)', transformed)
+    transformed = original
 
     statements = split_top_level_statements(transformed)
     var_spans = [(start, end, stmt) for start, end, stmt in statements if is_variable_statement(stmt)]
@@ -183,6 +291,7 @@ def main() -> int:
         first_var_start = len(transformed)
         prefix = transformed
     body = remove_spans(transformed[first_var_start:], [(start - first_var_start, end - first_var_start, stmt) for start, end, stmt in var_spans])
+    body = instrument_stores(body, set(var_names))
 
     kernels = re.findall(r'extern\s+"C"\s+int\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)', transformed)
     if not kernels:

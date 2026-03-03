@@ -3,40 +3,33 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace hb_native_sim {
 
 using eva_t = std::uint32_t;
 
-struct wait_word {
-  wait_word(int initial = 0) : value(initial), version(1) {}
-  wait_word(const wait_word&) = delete;
-  wait_word& operator=(const wait_word&) = delete;
-
-  wait_word& operator=(int next);
-  operator int() const;
-
-  std::atomic<int> value;
-  std::atomic<std::uint64_t> version;
+struct reservation_t {
+  const volatile void* addr = nullptr;
+  struct reservation_word_t* word = nullptr;
+  std::uint64_t epoch = 0;
 };
 
-struct reservation_t {
-  wait_word* word = nullptr;
-  const volatile void* addr = nullptr;
-  std::size_t size = 0;
-  std::uint64_t version = 0;
+struct reservation_word_t {
+  std::atomic<std::uint64_t> epoch{0};
 };
 
 enum class core_status : std::uint8_t {
   starting = 0,
   running = 1,
-  waiting_wait_word = 2,
-  waiting_memory = 3,
-  waiting_barrier = 4,
-  terminated = 5,
-  failed = 6,
+  waiting_memory = 2,
+  waiting_barrier = 3,
+  terminated = 4,
+  failed = 5,
 };
 
 struct barrier_t {
@@ -48,16 +41,18 @@ struct barrier_t {
 };
 
 struct simulation_state {
-  explicit simulation_state(std::size_t core_count)
-      : statuses(core_count), waited_words(core_count), waited_addrs(core_count),
-        wait_sizes(core_count), wait_targets(core_count), wake_epochs(core_count) {}
+  explicit simulation_state(std::size_t core_count, std::size_t scratchpad_word_count)
+      : statuses(core_count), waited_words(core_count), wait_targets(core_count),
+        scratchpad_words(scratchpad_word_count), scratchpad_mutexes(core_count) {}
 
   std::vector<std::atomic<core_status>> statuses;
-  std::vector<std::atomic<wait_word*>> waited_words;
-  std::vector<std::atomic<const volatile void*>> waited_addrs;
-  std::vector<std::atomic<std::size_t>> wait_sizes;
+  std::vector<std::atomic<reservation_word_t*>> waited_words;
   std::vector<std::atomic<std::uint64_t>> wait_targets;
-  std::vector<std::atomic<std::uint64_t>> wake_epochs;
+  std::vector<reservation_word_t> scratchpad_words;
+  std::vector<std::mutex> scratchpad_mutexes;
+  void* scratchpad_block = nullptr;
+  std::size_t scratchpad_size = 0;
+  std::size_t words_per_tile = 0;
   std::atomic<bool> abort_requested{false};
   std::atomic<bool> deadlock_detected{false};
 };
@@ -120,11 +115,51 @@ void* eva_to_ptr(eva_t addr);
 int current_x();
 int current_y();
 
-int bsg_lr(wait_word* word);
-int bsg_lr_aq(wait_word* word);
-int bsg_lr(const volatile void* addr, std::size_t size);
-int bsg_lr_aq(const volatile void* addr, std::size_t size);
-void wait_word_store(wait_word& word, int value);
+int bsg_lr(const volatile void* addr);
+int bsg_lr_aq(const volatile void* addr);
+void load_bytes(const volatile void* addr, void* out, std::size_t size);
+void store_bytes(void* addr, const void* value, std::size_t size);
+void store_bytes(volatile void* addr, const void* value, std::size_t size);
+void store_int_word(int* addr, int value);
+void store_int_word(volatile int* addr, int value);
+
+template <typename T>
+inline std::remove_cv_t<T> load(const T* addr) {
+  using value_type = std::remove_cv_t<T>;
+  value_type value{};
+  load_bytes(static_cast<const volatile void*>(addr), &value, sizeof(value_type));
+  return value;
+}
+
+template <typename T>
+inline std::remove_cv_t<T> load(const volatile T* addr) {
+  using value_type = std::remove_cv_t<T>;
+  value_type value{};
+  load_bytes(static_cast<const volatile void*>(addr), &value, sizeof(value_type));
+  return value;
+}
+
+template <typename T, typename U>
+inline void store(T* addr, U&& value) {
+  using value_type = std::remove_cv_t<T>;
+  if constexpr (std::is_same_v<value_type, int>) {
+    store_int_word(addr, static_cast<int>(std::forward<U>(value)));
+  } else {
+    const value_type typed_value = static_cast<value_type>(std::forward<U>(value));
+    store_bytes(addr, &typed_value, sizeof(value_type));
+  }
+}
+
+template <typename T, typename U>
+inline void store(volatile T* addr, U&& value) {
+  using value_type = std::remove_cv_t<T>;
+  if constexpr (std::is_same_v<value_type, int>) {
+    store_int_word(addr, static_cast<int>(std::forward<U>(value)));
+  } else {
+    const value_type typed_value = static_cast<value_type>(std::forward<U>(value));
+    store_bytes(addr, &typed_value, sizeof(value_type));
+  }
+}
 
 void barrier_init();
 void barrier_sync();
