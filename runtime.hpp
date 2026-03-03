@@ -3,7 +3,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,7 +38,6 @@ enum class core_status : std::uint8_t {
 
 struct barrier_t {
   void init(std::size_t participants);
-  void arrive_and_wait();
 
   std::size_t participants = 0;
   std::atomic<std::size_t> arrived{0};
@@ -48,13 +46,13 @@ struct barrier_t {
 
 struct simulation_state {
   explicit simulation_state(std::size_t core_count)
-      : statuses(core_count), waited_words(core_count) {}
+      : statuses(core_count), waited_words(core_count), wait_targets(core_count) {}
 
   std::vector<std::atomic<core_status>> statuses;
   std::vector<std::atomic<wait_word*>> waited_words;
+  std::vector<std::atomic<std::uint64_t>> wait_targets;
   std::atomic<bool> abort_requested{false};
   std::atomic<bool> deadlock_detected{false};
-  std::atomic<std::uint64_t> progress_epoch{0};
 };
 
 struct kernel_descriptor {

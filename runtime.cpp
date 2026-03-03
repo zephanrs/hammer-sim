@@ -18,26 +18,44 @@ int (*g_program_main)(int, char**) = nullptr;
 std::unordered_map<std::string, kernel_descriptor> g_kernels;
 thread_local core_context* g_current_core = nullptr;
 
-std::chrono::milliseconds deadlock_timeout() {
-  const char* env = std::getenv("HAMMER_SIM_DEADLOCK_TIMEOUT_MS");
-  if (env == nullptr || *env == '\0') {
-    return std::chrono::milliseconds(5000);
-  }
-  const long value = std::strtol(env, nullptr, 10);
-  if (value <= 0) {
-    return std::chrono::milliseconds(5000);
-  }
-  return std::chrono::milliseconds(value);
-}
-
-void advance_progress(simulation_state& simulation) {
-  simulation.progress_epoch.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void set_core_status(core_context& context, core_status status, wait_word* waited_word = nullptr) {
+void set_core_status(core_context& context, core_status status) {
   context.simulation->statuses[context.core_index].store(status, std::memory_order_release);
+  context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->wait_targets[context.core_index].store(0, std::memory_order_release);
+}
+
+void set_wait_word_state(core_context& context, wait_word* waited_word, std::uint64_t target_version) {
+  context.simulation->statuses[context.core_index].store(core_status::waiting_wait_word, std::memory_order_release);
   context.simulation->waited_words[context.core_index].store(waited_word, std::memory_order_release);
-  advance_progress(*context.simulation);
+  context.simulation->wait_targets[context.core_index].store(target_version, std::memory_order_release);
+}
+
+void set_barrier_state(core_context& context, std::uint64_t target_generation) {
+  context.simulation->statuses[context.core_index].store(core_status::waiting_barrier, std::memory_order_release);
+  context.simulation->waited_words[context.core_index].store(nullptr, std::memory_order_release);
+  context.simulation->wait_targets[context.core_index].store(target_generation, std::memory_order_release);
+}
+
+bool core_can_run(const simulation_state& simulation, const barrier_t& barrier, std::size_t core_index) {
+  const core_status status = simulation.statuses[core_index].load(std::memory_order_acquire);
+  switch (status) {
+    case core_status::starting:
+    case core_status::running:
+      return true;
+    case core_status::terminated:
+    case core_status::failed:
+      return false;
+    case core_status::waiting_wait_word: {
+      wait_word* word = simulation.waited_words[core_index].load(std::memory_order_acquire);
+      const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
+      return word != nullptr && word->version.load(std::memory_order_acquire) != target;
+    }
+    case core_status::waiting_barrier: {
+      const std::uint64_t target = simulation.wait_targets[core_index].load(std::memory_order_acquire);
+      return barrier.generation.load(std::memory_order_acquire) != target;
+    }
+  }
+  return false;
 }
 
 void request_abort(simulation_state& simulation, barrier_t& barrier) {
@@ -92,20 +110,6 @@ void barrier_t::init(std::size_t count) {
   participants = count;
   arrived.store(0, std::memory_order_relaxed);
   generation.store(0, std::memory_order_relaxed);
-}
-
-void barrier_t::arrive_and_wait() {
-  const std::size_t gen = generation.load(std::memory_order_acquire);
-  const std::size_t prior = arrived.fetch_add(1, std::memory_order_acq_rel);
-  if (prior + 1 == participants) {
-    arrived.store(0, std::memory_order_release);
-    generation.fetch_add(1, std::memory_order_acq_rel);
-    generation.notify_all();
-    return;
-  }
-  while (generation.load(std::memory_order_acquire) == gen) {
-    generation.wait(gen, std::memory_order_acquire);
-  }
 }
 
 void register_program_main(int (*fn)(int, char**)) {
@@ -188,10 +192,10 @@ int bsg_lr(wait_word* word) {
 
 int bsg_lr_aq(wait_word* word) {
   core_context& context = current_core_context();
-  set_core_status(context, core_status::waiting_wait_word, word);
   const std::uint64_t target = context.reservation.word == word
                                    ? context.reservation.version
                                    : word->version.load(std::memory_order_acquire);
+  set_wait_word_state(context, word, target);
   while (word->version.load(std::memory_order_acquire) == target) {
     word->version.wait(target, std::memory_order_acquire);
     throw_if_abort_requested();
@@ -210,9 +214,21 @@ void barrier_init() {
 
 void barrier_sync() {
   core_context& context = current_core_context();
-  set_core_status(context, core_status::waiting_barrier);
-  context.barrier->arrive_and_wait();
-  throw_if_abort_requested();
+  barrier_t& barrier = *context.barrier;
+  const std::uint64_t target_generation = barrier.generation.load(std::memory_order_acquire);
+  const std::size_t prior = barrier.arrived.fetch_add(1, std::memory_order_acq_rel);
+  if (prior + 1 == barrier.participants) {
+    barrier.arrived.store(0, std::memory_order_release);
+    barrier.generation.fetch_add(1, std::memory_order_acq_rel);
+    barrier.generation.notify_all();
+    return;
+  }
+
+  set_barrier_state(context, target_generation);
+  while (barrier.generation.load(std::memory_order_acquire) == target_generation) {
+    barrier.generation.wait(target_generation, std::memory_order_acquire);
+    throw_if_abort_requested();
+  }
   set_core_status(context, core_status::running);
 }
 
@@ -247,6 +263,9 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   for (auto& waited_word : simulation.waited_words) {
     waited_word.store(nullptr, std::memory_order_relaxed);
   }
+  for (auto& wait_target : simulation.wait_targets) {
+    wait_target.store(0, std::memory_order_relaxed);
+  }
 
   std::vector<std::thread> threads;
   threads.reserve(tile_count);
@@ -255,22 +274,19 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
   std::mutex error_mutex;
 
   watchdog = std::thread([&] {
-    const auto timeout = deadlock_timeout();
     const auto poll_interval = std::chrono::milliseconds(10);
-    std::uint64_t last_epoch = simulation.progress_epoch.load(std::memory_order_acquire);
-    auto stalled_since = std::chrono::steady_clock::now();
 
     while (!simulation.abort_requested.load(std::memory_order_acquire)) {
-      std::size_t running_or_starting = 0;
       std::size_t terminated_or_failed = 0;
+      bool any_runnable = false;
 
-      for (auto& status_slot : simulation.statuses) {
-        const core_status status = status_slot.load(std::memory_order_acquire);
-        if (status == core_status::starting || status == core_status::running) {
-          ++running_or_starting;
-        }
+      for (std::size_t i = 0; i < tile_count; ++i) {
+        const core_status status = simulation.statuses[i].load(std::memory_order_acquire);
         if (status == core_status::terminated || status == core_status::failed) {
           ++terminated_or_failed;
+        }
+        if (core_can_run(simulation, barrier, i)) {
+          any_runnable = true;
         }
       }
 
@@ -278,11 +294,7 @@ int run_kernel(device_state& device, const kernel_launch& launch) {
         return;
       }
 
-      const std::uint64_t epoch = simulation.progress_epoch.load(std::memory_order_acquire);
-      if (running_or_starting != 0 || epoch != last_epoch) {
-        last_epoch = epoch;
-        stalled_since = std::chrono::steady_clock::now();
-      } else if (std::chrono::steady_clock::now() - stalled_since >= timeout) {
+      if (!any_runnable) {
         simulation.deadlock_detected.store(true, std::memory_order_release);
         request_abort(simulation, barrier);
         return;

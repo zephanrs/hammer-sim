@@ -218,17 +218,13 @@ The runtime tracks whether every simulated tile is:
 - terminated
 
 If not all tiles have terminated and no tile can make progress for the configured
-timeout, the runtime aborts the launch, prints a red deadlock message, and the
-test exits with code `2`. A regular non-deadlock test failure exits with code
-`1`.
+blocked states, the runtime aborts the launch, prints a red deadlock message,
+and the test exits with code `2`. A regular non-deadlock test failure exits
+with code `1`.
 
-Configure the timeout with:
-
-```sh
-HAMMER_SIM_DEADLOCK_TIMEOUT_MS=5000
-```
-
-The default is `5000` milliseconds.
+There is no deadlock timeout. A deadlock is only reported when every
+non-terminated core is blocked and none of the blocked conditions has become
+runnable.
 
 ## Performance Status
 
