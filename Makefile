@@ -73,7 +73,7 @@ $(RUNNER_MAKEFILE): app_bin.mk $(TEST_DEFS_MK) $(TESTS_MK)
 	} > $@
 
 run: $(RUNNER_MAKEFILE)
-	$(MAKE) -C $(BIN_DIR) run-all
+	@$(MAKE) -C $(BIN_DIR) run-all
 
 run-all: run
 test: run

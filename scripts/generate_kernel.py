@@ -94,6 +94,17 @@ def split_top_level_statements(text: str):
     return spans
 
 
+def strip_register_bindings(text: str) -> str:
+    # HammerBlade kernels sometimes pin locals to architecture-specific
+    # registers like s4/s5. Those names are invalid on the native host, so
+    # strip only the binding while keeping the declaration intact.
+    return re.sub(
+        r'(\bregister\b[^;\n]*?\b[A-Za-z_][A-Za-z0-9_]*)\s+asm\s*\(\s*"[^"]+"\s*\)',
+        r'\1',
+        text,
+    )
+
+
 def is_variable_statement(stmt: str) -> bool:
     # We only want file-scope storage declarations here. Everything else stays
     # in the generated kernel body unchanged.
@@ -277,7 +288,7 @@ def main() -> int:
     out_path = Path(sys.argv[2])
     original = src_path.read_text()
 
-    transformed = original
+    transformed = strip_register_bindings(original)
 
     statements = split_top_level_statements(transformed)
     var_spans = [(start, end, stmt) for start, end, stmt in statements if is_variable_statement(stmt)]

@@ -48,6 +48,7 @@ run-all:
 		printf '%-*s  %b\n' "$$width" '$(test)' "$$status"; \
 		rm -f "$$log"; \
 	) \
+	printf '\n'; \
 	exit $$rc
 test: run-all
 
